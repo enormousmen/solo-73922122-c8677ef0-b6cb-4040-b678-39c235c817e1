@@ -2,7 +2,7 @@ services:
   dns-planner:
     build:
       context: .
-    image: dns-release-planner:1.0.0
+    image: dns-release-planner:1.1.0
     container_name: dns-release-planner
     ports:
       - "8000:8000"

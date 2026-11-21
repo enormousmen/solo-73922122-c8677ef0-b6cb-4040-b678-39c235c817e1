@@ -1,14 +1,21 @@
 # 跨区 DNS 变更发布顺序规划器
 
-给内网 DNS 值班员用的 FastAPI 服务。提交最多 8 个**互不嵌套**的权威区的
-新旧 A / CNAME 记录，以及必须持续可解析的业务域名，服务按**无缓存权威记录**
-推演每一次**整区切换**后的解析状态，回答三件事：
+给内网 DNS 值班员用的 FastAPI 服务，包含两个接口：
 
-1. **有没有安全顺序**：有则返回逐步发布顺序，并给出每一步前后的解析结果。
-2. **现状是否已经坏了**：若按现状（所有区都还是旧记录）就查不到 IPv4 地址，
-   直接返回故障链路，不再谈发布顺序。
-3. **没有安全顺序时卡在哪**：返回能安全走到的**最大前缀**，并逐个说明剩余
-   每个区若紧接着发布会断在哪条解析链上，区分**缺记录**与**成环**。
+* **`POST /plan`** — 发布顺序推演。提交最多 8 个**互不嵌套**的权威区的
+  新旧 A / CNAME 记录，以及必须持续可解析的业务域名，服务按**无缓存权威记录**
+  推演每一次**整区切换**后的解析状态，回答三件事：
+
+  1. **有没有安全顺序**：有则返回逐步发布顺序，并给出每一步前后的解析结果。
+  2. **现状是否已经坏了**：若按现状（所有区都还是旧记录）就查不到 IPv4 地址，
+     直接返回故障链路，不再谈发布顺序。
+  3. **没有安全顺序时卡在哪**：返回能安全走到的**最大前缀**，并逐个说明剩余
+     每个区若紧接着发布会断在哪条解析链上，区分**缺记录**与**成环**。
+
+* **`POST /pcap/dns-response-check`** — 离线抓包核查。客户端抓包里 DNS 查询
+  等不到应答时，上传经典 PCAP（以太网 / IPv4 / UDP，≤ 5 MiB），指定 A 查询帧
+  和截止帧，核查两帧之间的回包是**完整到达**、**缺片**还是**无法归属**，
+  详见下文「离线抓包核查」。
 
 ## 推演模型
 
@@ -54,7 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### `GET /healthz`
 
 ```json
-{"status": "ok", "version": "1.0.0"}
+{"status": "ok", "version": "1.1.0"}
 ```
 
 ### `POST /plan`
@@ -169,6 +176,126 @@ curl -s -X POST http://localhost:8000/plan \
 python examples/demo.py
 ```
 
+## 离线抓包核查（DNS 回包缺片）
+
+客户端抓包里 DNS 查询等不到应答时，用这个接口确认回包是否缺片。
+上传**经典 PCAP**（以太网 / IPv4 / UDP，≤ 5 MiB；不支持 pcapng），用表单字段
+指定 **A 查询帧**和**截止帧**（均为 1 起的抓包帧号，与 Wireshark 一致），
+服务核查**查询帧之后、含截止帧**的窗口内的回包。
+
+### 判定逻辑
+
+1. **关联首片**：窗口内按「反向地址 + 反向端口 + DNS 事务号」匹配回包
+   **首片**（分片偏移为 0 的片，只有它带 UDP 头和事务号）。
+2. **汇集分片**：命中的首片按「源/目的地址 + IPv4 标识（identification）」
+   把同组所有分片归拢到一个数据报。
+3. **判定完整**：以首片 UDP 长度为准做字节覆盖统计，**分片乱序或重复不影响
+   完整与缺片的判定**。
+4. **核对问题段**：组装完整后解析 DNS，**问题段与查询一致才返回响应码**
+   （同时校验 QR 位与事务号）；不一致则结论为 `question_mismatch`，不返回响应码。
+5. **缺片**：有匹配首片但未收全时，按 UDP 长度给出**缺失字节区间**
+   （`missing_ranges`，偏移自 UDP 头起算，半开区间）。
+6. **无法归属**：窗口内只有非首片（读不到端口和事务号），或同一组地址和
+   IPv4 标识下出现**内容不同的首片**时，这些分片列为 `unattributable`。
+
+### 结论（`verdict`）
+
+| verdict | 含义 | 对应帧号位置 |
+| --- | --- | --- |
+| `answered` | 收到完整应答，问题段一致，`response.rcode` 给出响应码 | `response.frames` |
+| `question_mismatch` | 组装完整但问题段/QR/事务号与查询不符，不返回响应码 | `response.frames` |
+| `missing_fragments` | 有匹配首片但未收全，`missing[].missing_ranges` 给出缺失区间 | `missing[].frames` |
+| `unattributable` | 只有非首片 / 同组不同首片 / 首片无法核验 | `unattributable[].frames` |
+| `no_response` | 窗口内未观察到任何匹配的回包分片 | — |
+
+多种情况并存时按上表顺序取头条结论，其余在 `missing` / `unattributable`
+列表里完整保留。`unattributable[].reason` 区分
+`only_non_first_fragments`（只有非首片）、`conflicting_first_fragments`
+（同组不同首片）、`first_fragment_unverifiable`（首片过短或长度非法）。
+
+### 调用示例
+
+仓库自带 8 个抓包样例（`examples/pcap/`，由 `examples/make_pcaps.py` 生成，
+可重新生成），每个样例的查询帧都是第 1 帧：
+
+```bash
+# 完整应答（未分片）-> answered / NOERROR
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/01-complete-unfragmented.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=2" | python -m json.tool
+
+# 分片乱序 + 重复，仍完整 -> answered（判定不受乱序/重复影响）
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/02-complete-fragments-out-of-order.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=5" | python -m json.tool
+
+# 中间缺一片 -> missing_fragments，missing_ranges = [{offset: 48, length: 48}]
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/03-missing-fragment.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=3" | python -m json.tool
+
+# 只有非首片 -> unattributable / only_non_first_fragments
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/04-only-non-first-fragments.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=3" | python -m json.tool
+
+# 同组地址+标识出现不同首片 -> unattributable / conflicting_first_fragments
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/05-conflicting-first-fragments.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=5" | python -m json.tool
+
+# 窗口内没有匹配回包 -> no_response
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/06-no-response.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=3" | python -m json.tool
+
+# 问题段对不上 -> question_mismatch（不返回响应码）
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/07-question-mismatch.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=3" | python -m json.tool
+
+# 完整 NXDOMAIN 应答 -> answered，rcode = 3
+curl -s -X POST http://localhost:8000/pcap/dns-response-check \
+  -F "file=@examples/pcap/08-nxdomain.pcap" \
+  -F "query_frame=1" -F "cutoff_frame=2" | python -m json.tool
+```
+
+一键跑全部样例：
+
+```bash
+examples/check_samples.sh            # 打向 http://localhost:8000
+python examples/demo_pcap.py         # 不启动服务，进程内跑同一套逻辑
+```
+
+`missing_fragments` 的响应节选（偏移自 UDP 头起算）：
+
+```json
+{
+  "verdict": "missing_fragments",
+  "missing": [
+    {
+      "frames": [2, 3],
+      "identification": 20483,
+      "udp_length": 105,
+      "received_ranges": [{"offset": 0, "length": 48}, {"offset": 96, "length": 9}],
+      "missing_ranges": [{"offset": 48, "length": 48}],
+      "last_fragment_seen": true
+    }
+  ]
+}
+```
+
+### 抓包核查的限制
+
+* 只支持经典 PCAP、以太网链路（含 802.1Q 标签）、IPv4、UDP；IPv6、
+  TCP 承载的 DNS、pcapng 不在范围内（不满足时按 422 或「非候选帧」处理）。
+* 查询帧本身必须是未分片的 DNS A 查询，否则返回 422。
+* 帧号 1 起，与 Wireshark `frame.number` 一致；窗口为查询帧之后、含截止帧。
+* 因 snaplen 被抓包截断的帧，未捕获字节按「未收到」计入缺片，并在
+  `notes` 里标明对应帧号。
+* 重叠分片内容冲突时按先捕获的字节组装（判定结论不受影响），并在
+  `missing[].overlap_conflict` 标明。
+
 ## 测试
 
 ```bash
@@ -178,7 +305,9 @@ pytest
 
 覆盖：安全顺序、必须后发/先发的依赖、现状故障（缺记录 / 成环 / 链出区 /
 链过长 / NODATA vs NXDOMAIN）、无解时的最大前缀与逐区卡点、随机小规模实例与
-穷举结果的等价性校验、请求校验与 HTTP 状态码。
+穷举结果的等价性校验、请求校验与 HTTP 状态码；抓包核查覆盖五种结论、
+分片乱序/重复不变性、缺失区间计算、IPv4 标识分组、首片冲突、snaplen 截断、
+文件校验与 413/422。
 
 ## 限制
 
